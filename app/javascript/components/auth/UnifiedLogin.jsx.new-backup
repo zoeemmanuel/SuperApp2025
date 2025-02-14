@@ -1,0 +1,665 @@
+// Part 1 - Imports and Initial Setup
+import React, { useState, useEffect } from 'react';
+import { Alert, AlertTitle } from '@/components/ui/alert';
+import { X } from 'lucide-react';
+import DeviceFingerprint from '../../device_fingerprint';
+
+const UnifiedLogin = () => {
+  // State management for all flows
+  const [identifier, setIdentifier] = useState('');
+  const [step, setStep] = useState('checking');
+  const [verificationCode, setVerificationCode] = useState('');
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [deviceInfo, setDeviceInfo] = useState(null);
+  const [allowGuid, setAllowGuid] = useState(false);
+  const [knownHandle, setKnownHandle] = useState('');
+  const [maskedPhone, setMaskedPhone] = useState('');
+  const [verifiedPhone, setVerifiedPhone] = useState('');
+  const [databasePath, setDatabasePath] = useState(null);
+  const [isPhoneVerified, setIsPhoneVerified] = useState(false);
+  const [suggestedHandle, setSuggestedHandle] = useState('');
+  const [isExistingDevice, setIsExistingDevice] = useState(false);
+
+  // API URL handling with domain configuration
+  const getApiUrl = (endpoint) => {
+    const domain = 'superappproject.com';
+    return `https://${domain}${endpoint}`;
+  };
+
+  const getDeviceData = async (forceRefresh = false) => {
+    try {
+      let currentDeviceInfo = !forceRefresh && (deviceInfo || window.deviceInfo);
+      
+      if (!currentDeviceInfo) {
+        console.log('Generating new device fingerprint...');
+        currentDeviceInfo = await DeviceFingerprint.generate();
+        setDeviceInfo(currentDeviceInfo);
+        window.deviceInfo = currentDeviceInfo;
+      }
+
+      // Handle database path consistently
+      const dbPath = databasePath || localStorage.getItem('device_database_path');
+      if (dbPath) {
+        const decodedPath = decodeURIComponent(dbPath);
+        console.log('Using database path:', decodedPath);
+        
+        // Always use decoded path in device info
+        currentDeviceInfo = {
+          ...currentDeviceInfo,
+          database: {
+            path: decodedPath,
+            exists: true,
+            source: databasePath ? 'state' : 'localStorage'
+          }
+        };
+      }
+
+      return currentDeviceInfo;
+    } catch (error) {
+      console.error('Error getting device data:', error);
+      throw error;
+    }
+  };
+// Part 2 - Storage and Authentication Functions
+const handleStorageSync = async (response) => {
+  try {
+    const storageHeader = response.headers.get('X-Set-Storage');
+    if (storageHeader) {
+      const storageData = JSON.parse(storageHeader);
+      
+      if (storageData.device_database_path) {
+        localStorage.setItem('device_database_path', storageData.device_database_path);
+        setDatabasePath(storageData.device_database_path);
+      }
+
+      if (storageData.verification_id) {
+        sessionStorage.setItem('verification_id', storageData.verification_id);
+      }
+
+      if (storageData.device_id) {
+        const updatedDeviceInfo = await getDeviceData();
+        setDeviceInfo({
+          ...updatedDeviceInfo,
+          device_id: storageData.device_id,
+          database: {
+            path: storageData.device_database_path,
+            exists: true,
+            source: 'server'
+          }
+        });
+      }
+
+      if (storageData.handle) {
+        setKnownHandle(storageData.handle);
+      }
+      if (storageData.verified !== undefined) {
+        setIsPhoneVerified(storageData.verified);
+      }
+    }
+  } catch (error) {
+    console.error('Storage sync error:', error);
+  }
+};
+
+const makeAuthenticatedRequest = async (url, payload) => {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-CSRF-Token': document.querySelector('[name="csrf-token"]')?.content
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+    }
+
+    return response;
+  } catch (error) {
+    console.error('Request failed:', error);
+    throw error;
+  }
+};
+
+useEffect(() => {
+  let mounted = true;
+
+  const initializeDevice = async () => {
+    try {
+      const deviceData = window.initialDeviceData || {};
+      
+      if (deviceData.guid_enabled && deviceData.handle) {
+        setKnownHandle(deviceData.handle);
+        setMaskedPhone(deviceData.masked_phone || '');
+        setAllowGuid(true);
+        setIsExistingDevice(true);
+        setIdentifier(deviceData.handle);
+        setStep('verify_prompt');
+      } else {
+        const deviceInfo = await DeviceFingerprint.generate();
+        if (!mounted) return;
+        
+        const checkResult = await checkDevice(deviceInfo);
+        if (!mounted) return;
+
+        if (checkResult?.status === 'device_known') {
+          setKnownHandle(checkResult.handle || '');
+          setMaskedPhone(checkResult.masked_phone || '');
+          setAllowGuid(true);
+          setIsExistingDevice(true);
+          setIdentifier(checkResult.handle || '');
+          setStep('verify_prompt');
+        } else {
+          setStep('initial');
+          setAllowGuid(false);
+          setIsExistingDevice(false);
+        }
+      }
+    } catch (error) {
+      console.error('Device initialization failed:', error);
+      if (!mounted) return;
+      setStep('initial');
+    }
+  };
+
+  initializeDevice();
+  return () => {
+    mounted = false;
+  };
+}, []);
+// Part 3 - Core Handler Functions
+const checkDevice = async (info) => {
+  console.log('Checking device with info:', info);
+  if (!info) {
+    console.error('Device info missing in checkDevice');
+    setError('Device information unavailable');
+    setStep('initial');
+    return;
+  }
+
+  try {
+    if (info.database?.path) {
+      info.database.path = decodeURIComponent(info.database.path);
+    }
+
+    const response = await makeAuthenticatedRequest('/api/v1/auth/check_device', { 
+      device_data: info 
+    });
+
+    if (!response.ok) {
+      throw new Error('Device check failed');
+    }
+
+    const data = await response.json();
+    console.log('Device check response:', data);
+
+    if (data.database_path) {
+      const cleanPath = decodeURIComponent(data.database_path);
+      localStorage.setItem('device_database_path', cleanPath);
+      setDatabasePath(cleanPath);
+    }
+
+    if (data.status === 'device_known') {
+      setKnownHandle(data.handle);
+      setMaskedPhone(data.masked_phone);
+      setAllowGuid(true);
+      setIsExistingDevice(true);
+      
+      if (data.handle) {
+        setIdentifier(data.handle);
+      }
+      
+      if (data.verified) {
+        window.location.href = data.redirect_to || '/dashboard';
+        return data;
+      } else {
+        setStep('code');
+        setMessage(`Please verify this device using ${data.masked_phone}`);
+        return data;
+      }
+    }
+
+    setStep('initial');
+    setAllowGuid(false);
+    setIsExistingDevice(false);
+    return data;
+  } catch (error) {
+    console.error('Device check error:', error);
+    setError(error.message || 'Unable to verify device');
+    setStep('initial');
+    throw error;
+  }
+};
+
+const handleInitialSubmit = async (e) => {
+  e.preventDefault();
+  setError('');
+  setIsLoading(true);
+
+  try {
+    const deviceData = await getDeviceData();
+    
+    const payload = {
+      device_data: deviceData,
+      phone: identifier.trim()
+    };
+
+    console.log('Initial submit payload:', payload);
+
+    const response = await fetch('/api/v1/auth/phone_login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-CSRF-Token': document.querySelector('[name="csrf-token"]')?.content
+      },
+      credentials: 'include',
+      body: JSON.stringify(payload)
+    });
+
+    const data = await response.json();
+    await handleStorageSync(response);
+
+    if (data.status === 'confirm_number') {
+      setMaskedPhone(data.masked_phone || identifier);
+      setKnownHandle(data.handle || '');
+      setStep('verify_prompt');
+      setMessage(data.message);
+    } else {
+      throw new Error(data.message || 'Unexpected response');
+    }
+  } catch (error) {
+    console.error('Initial submit error:', error);
+    setError(error.message || 'Authentication failed');
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+// FIXED handleVerifyClick - This is the only version that should exist
+const handleVerifyClick = async () => {
+  setError('');
+  setIsLoading(true);
+  console.log('Starting verification process...');
+
+  try {
+    const deviceData = await getDeviceData();
+    
+    const payload = {
+      device_data: deviceData,
+      phone: maskedPhone.replace(/[^0-9+]/g, ''),
+      send_code: 1  // Explicit numeric value
+    };
+    
+    console.log('Sending verification request with payload:', payload);
+    
+    const response = await fetch('/api/v1/auth/phone_login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-CSRF-Token': document.querySelector('[name="csrf-token"]')?.content
+      },
+      credentials: 'include',
+      body: JSON.stringify(payload)
+    });
+
+    console.log('Response received:', response.status);
+    const data = await response.json();
+    console.log('Response data:', data);
+
+    if (data.status === 'pending_verification') {
+      setStep('code');
+      setMessage(data.message);
+    } else if (data.status === 'confirm_number') {
+      setMaskedPhone(data.masked_phone || maskedPhone);
+      setKnownHandle(data.handle || '');
+      setStep('verify_prompt');
+      setMessage(data.message);
+    } else {
+      throw new Error('Unexpected response status: ' + data.status);
+    }
+
+    await handleStorageSync(response);
+  } catch (error) {
+    console.error('Verification error:', error);
+    setError(error.message || 'Failed to send verification code');
+  } finally {
+    setIsLoading(false);
+  }
+};
+// Part 4 - Additional Handlers and Initial Renders
+const handleSetupHandle = async (e) => {
+  e.preventDefault();
+  setError('');
+  setIsLoading(true);
+
+  try {
+    const trimmedHandle = suggestedHandle.trim().replace(/^@+/, '');
+    
+    if (!trimmedHandle.match(/^[a-zA-Z0-9_]+$/)) {
+      throw new Error('Handle can only contain letters, numbers, and underscores');
+    }
+
+    const deviceData = await getDeviceData();
+    const response = await makeAuthenticatedRequest('/api/v1/auth/update_handle', {
+      device_data: deviceData,
+      handle: trimmedHandle
+    });
+
+    const data = await response.json();
+    
+    if (!response.ok) {
+      throw new Error(data.message || 'Failed to set handle');
+    }
+
+    if (data.database_path) {
+      localStorage.setItem('device_database_path', data.database_path);
+    }
+
+    if (data.status === 'success') {
+      setKnownHandle(data.handle);
+      window.location.href = data.redirect_to || '/dashboard';
+    } else {
+      throw new Error('Unexpected response');
+    }
+  } catch (error) {
+    console.error('Handle setup error:', error);
+    setError(error.message || 'Failed to set handle');
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+const handleLogout = async () => {
+  setIsLoading(true);
+  try {
+    const deviceData = await getDeviceData();
+    const response = await makeAuthenticatedRequest('/api/v1/auth/logout', {
+      device_data: deviceData
+    });
+    const data = await response.json();
+
+    const dbPath = localStorage.getItem('device_database_path');
+    
+    localStorage.clear();
+    sessionStorage.clear();
+    
+    if (dbPath) {
+      localStorage.setItem('device_database_path', dbPath);
+    }
+
+    setDeviceInfo(prev => ({
+      ...prev,
+      database: {
+        path: dbPath,
+        exists: true,
+        source: 'localStorage'
+      }
+    }));
+    
+    setKnownHandle('');
+    setIdentifier('');
+    setVerifiedPhone('');
+    setIsPhoneVerified(false);
+    setAllowGuid(true);
+    setIsExistingDevice(true);
+    setStep('initial');
+
+    if (data.redirect_to) {
+      if (data.force_reload) {
+        window.location.href = data.redirect_to;
+      } else {
+        window.location.replace(data.redirect_to);
+      }
+    }
+  } catch (error) {
+    console.error('Logout error:', error);
+    setError('Failed to logout. Please try again.');
+    window.location.href = '/login';
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+const resendVerificationCode = async () => {
+  setError('');
+  setIsLoading(true);
+
+  try {
+    const deviceData = await getDeviceData();
+    const response = await makeAuthenticatedRequest('/api/v1/auth/resend_code', {
+      device_data: deviceData,
+      phone: verifiedPhone || maskedPhone.replace(/[^0-9+]/g, '')
+    });
+
+    const data = await response.json();
+    
+    if (!response.ok) {
+      throw new Error(data.message || 'Failed to resend code');
+    }
+
+    setMessage(data.message || 'New verification code sent');
+  } catch (error) {
+    console.error('Resend code error:', error);
+    setError(error.message || 'Failed to resend code');
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+// Initial Render Methods
+const renderCheckingStep = () => (
+  <div className="text-center">
+    <h2 className="text-2xl font-bold mb-6">Welcome to SuperApp</h2>
+    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-600 mx-auto"></div>
+    <p className="mt-4 text-gray-600">Checking your device...</p>
+  </div>
+);
+
+const renderInitialStep = () => (
+  <div>
+    <h2 className="text-2xl font-bold mb-6 text-center">
+      Welcome to SuperApp
+    </h2>
+    
+    <form onSubmit={handleInitialSubmit}>
+      <div className="space-y-6">
+        <div>
+          <label htmlFor="identifier" className="block text-sm font-medium text-gray-700">
+            Phone Number
+          </label>
+          <div className="mt-1">
+            <input
+              id="identifier"
+              name="identifier"
+              type="text"
+              required
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
+              className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+              placeholder="+44/+65"
+              autoComplete="tel"
+              disabled={isLoading}
+            />
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          disabled={isLoading || !identifier.trim()}
+          className={`w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${
+            isLoading || !identifier.trim() 
+              ? 'bg-purple-400 cursor-not-allowed'
+              : 'bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500'
+          }`}
+        >
+          {isLoading ? (
+            <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+          ) : (
+            'Continue'
+          )}
+        </button>
+      </div>
+    </form>
+  </div>
+);
+// Part 5 - Final Render Functions
+const renderVerifyPrompt = () => (
+  <div>
+    <h2 className="text-2xl font-bold mb-2 text-center">
+      {knownHandle ? `Welcome back ${knownHandle}!` : 'Verify Your Number'}
+    </h2>
+    <p className="text-center text-gray-600 mb-6">
+      Click continue to verify: {maskedPhone}
+    </p>
+    <div className="space-y-6">
+      <button
+        onClick={async (e) => {
+          e.preventDefault();
+          setError('');
+          setIsLoading(true);
+
+          try {
+            const deviceData = await getDeviceData();
+            console.log('Sending verification request...');
+            
+            const payload = {
+              device_data: deviceData,
+              phone: maskedPhone.replace(/[^0-9+]/g, ''),
+              send_code: true,  // Explicitly set to true
+              needs_code: true  // Additional flag
+            };
+
+            console.log('Request payload:', payload);
+            
+            const response = await fetch('/api/v1/auth/phone_login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'X-CSRF-Token': document.querySelector('[name="csrf-token"]')?.content
+              },
+              credentials: 'include',
+              body: JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+            console.log('Response:', data);
+
+            if (data.status === 'pending_verification') {
+              setStep('code');
+              setMessage(data.message);
+            } else {
+              throw new Error('Unexpected response');
+            }
+
+            await handleStorageSync(response);
+          } catch (error) {
+            console.error('Verification error:', error);
+            setError(error.message || 'Failed to send verification code');
+          } finally {
+            setIsLoading(false);
+          }
+        }}
+        disabled={isLoading}
+        className={`w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${
+          isLoading ? 'bg-purple-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'
+        }`}
+      >
+        {isLoading ? (
+          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+        ) : (
+          'Continue'
+        )}
+      </button>
+    </div>
+    {error && (
+      <div className="mt-4">
+        <Alert variant="destructive">
+          <AlertTitle className="flex items-center justify-between">
+            <span>Error</span>
+            <X 
+              className="h-4 w-4 cursor-pointer" 
+              onClick={() => setError('')}
+            />
+          </AlertTitle>
+          <p className="text-sm">{error}</p>
+        </Alert>
+      </div>
+    )}
+    <div className="mt-4 text-center">
+      <button
+        onClick={() => setStep('initial')}
+        className="text-sm text-purple-600 hover:text-purple-500"
+      >
+        Not {knownHandle}? Switch account
+      </button>
+    </div>
+  </div>
+);
+
+const renderStep = () => {
+  switch (step) {
+    case 'checking':
+      return renderCheckingStep();
+    case 'initial':
+      return renderInitialStep();
+    case 'verify_prompt':
+      return renderVerifyPrompt();
+    case 'code':
+      return renderCodeStep();
+    case 'handle':
+      return renderHandleStep();
+    default:
+      return null;
+  }
+};
+
+// Main component render
+return (
+  <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
+    <div className="sm:mx-auto sm:w-full sm:max-w-md">
+      <div className="bg-white py-8 px-4 shadow sm:rounded-lg sm:px-10">
+        {renderStep()}
+        {error && (
+          <div className="mt-4">
+            <Alert variant="destructive">
+              <AlertTitle className="flex items-center justify-between">
+                <span>Error</span>
+                <X 
+                  className="h-4 w-4 cursor-pointer" 
+                  onClick={() => setError('')}
+                />
+              </AlertTitle>
+              <p className="text-sm">{error}</p>
+            </Alert>
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+);
+};
+
+// Utility functions
+const isSafariBrowser = () => {
+  const ua = navigator.userAgent.toLowerCase();
+  return ua.includes('safari') && !ua.includes('chrome');
+};
+
+const isMobileDevice = () => {
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+};
+
+export default UnifiedLogin;
+

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title><%= yield :title %></title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <%= csrf_meta_tags %>
+  <%= csp_meta_tag %>
+  
+  <!-- Security headers -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' https://cdn.tailwindcss.com https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com">
+  <meta http-equiv="X-Content-Type-Options" content="nosniff">
+  <meta http-equiv="X-Frame-Options" content="DENY">
+  
+  <!-- Add Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gray-50">
+  <!-- Flash messages -->
+  <% flash.each do |name, msg| %>
+    <div class="fixed top-4 left-1/2 transform -translate-x-1/2 max-w-sm w-full bg-white rounded-lg shadow-lg p-4 <%= name == 'notice' ? 'text-green-600' : 'text-red-600' %>">
+      <%= msg %>
+    </div>
+  <% end %>
+
+  <!-- React mount point -->
+  <main id="login-root" class="w-full max-w-md mx-auto py-12">
+    <%= yield %>
+  </main>
+
+  <!-- Loading spinner -->
+  <div id="app-loading" class="fixed inset-0 bg-white z-50 flex items-center justify-center">
+    <div class="text-center">
+      <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-purple-600"></div>
+      <p class="mt-4 text-gray-600">Loading application...</p>
+    </div>
+  </div>
+
+  <!-- Load React before application.js -->
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <%= javascript_include_tag "application", defer: true %>
+</body>
+</html>

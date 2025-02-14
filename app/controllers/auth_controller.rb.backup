@@ -1,0 +1,530 @@
+class AuthController < ApplicationController
+  include DeviceAuthenticationConcern
+  include AuthenticationConcern
+  
+  skip_before_action :authenticate_user!, only: [:login, :phone_login, :verify_code, :verify_guid, :verify_guid_code, :update_handle]
+  skip_before_action :verify_authenticity_token, only: [:phone_login, :verify_code, :verify_guid, :verify_guid_code]
+  layout 'auth'
+  
+def logout
+  device = current_device
+  handle = device&.user&.handle
+  database_path = device&.device_database&.path
+
+  if device && database_path
+    # For any known device (verified or not), preserve device info but mark as needing verification
+    update_device_database(device, {
+      verified: false,
+      last_sync: Time.current.iso8601
+    })
+    
+    # Clear session but keep database path for GUID flow
+    cookies.delete(:device_token, domain: determine_cookie_domain)
+    cookies.delete(:_superapp_session, domain: determine_cookie_domain)
+    
+    storage_data = {
+      device_database_path: database_path,
+      handle: handle,
+      verified: false,
+      guid_enabled: true,
+      sync_time: Time.current.iso8601
+    }
+    
+    response.headers['X-Set-Storage'] = storage_data.to_json
+    reset_session
+    
+    render json: {
+      status: 'success',
+      handle: handle,
+      database_path: database_path,
+      verified: false,
+      redirect_to: '/login'
+    }
+  else
+    # Only clear everything if we somehow got a corrupted state
+    cookies.delete(:device_database_path, domain: determine_cookie_domain)
+    cookies.delete(:device_token, domain: determine_cookie_domain)
+    reset_session
+    
+    render json: {
+      status: 'error',
+      message: 'Invalid device state detected, please log in again',
+      redirect_to: '/login'
+    }
+  end
+end
+
+def logout
+  device = current_device
+  handle = device&.user&.handle
+  database_path = device&.device_database&.path
+
+  if device && database_path
+    # For any known device (verified or not), preserve device info but mark as needing verification
+    update_device_database(device, {
+      verified: false,
+      last_sync: Time.current.iso8601
+    })
+    
+    # Clear session but keep database path for GUID flow
+    cookies.delete(:device_token, domain: determine_cookie_domain)
+    cookies.delete(:_superapp_session', domain: determine_cookie_domain)
+    
+    storage_data = {
+      device_database_path: database_path,
+      handle: handle,
+      verified: false,
+      guid_enabled: true,
+      sync_time: Time.current.iso8601
+    }
+    
+    response.headers['X-Set-Storage'] = storage_data.to_json
+    reset_session
+    
+    render json: {
+      status: 'success',
+      handle: handle,
+      database_path: database_path,
+      verified: false,
+      redirect_to: '/login'
+    }
+  else
+    # Only clear everything if we somehow got a corrupted state
+    cookies.delete(:device_database_path, domain: determine_cookie_domain)
+    cookies.delete(:device_token, domain: determine_cookie_domain)
+    reset_session
+    
+    render json: {
+      status: 'error',
+      message: 'Invalid device state detected, please log in again',
+      redirect_to: '/login'
+    }
+  end
+end
+
+  def verify_code
+    Rails.logger.info "=== VERIFY CODE START ==="
+    Rails.logger.info "Code: #{params[:code]}"
+    Rails.logger.info "Verification ID: #{cookies.signed[:verification_id]}"
+    
+    begin
+      verification_id = cookies.signed[:verification_id]
+      verification_data = retrieve_verification_data("verification:#{verification_id}")
+
+      unless verification_data
+        return render json: { 
+          status: 'error',
+          message: 'Verification session expired'
+        }, status: :unprocessable_entity
+      end
+
+      unless verification_data[:code] == params[:code]
+        return render json: {
+          status: 'error',
+          message: 'Invalid verification code'
+        }, status: :unprocessable_entity
+      end
+
+      user = User.find_by(phone: verification_data[:phone])
+      device_data = verification_data[:device_data]
+
+      if user
+        device = find_or_create_device(user, device_data)
+        ensure_database_exists(device)
+        mark_device_verified(device)
+        sync_database_path(device)
+        
+        session[:user_id] = user.id
+        set_device_token(device)
+
+        remove_verification_data("verification:#{verification_id}")
+        clear_verification_cookies
+
+        render json: {
+          status: 'authenticated',
+          redirect_to: '/dashboard',
+          database_path: device.device_database.path,
+          handle: user.handle
+        }
+      else
+        verification_data[:verified] = true
+        store_verification_data("handle_pending:#{verification_id}", verification_data)
+        
+        render json: {
+          status: 'needs_handle',
+          message: 'Please set your handle to continue',
+          database_path: device_data.dig('database', 'path'),
+          suggested_handle: generate_suggested_handle
+        }
+      end
+    rescue StandardError => e
+      Rails.logger.error "Code verification error: #{e.message}"
+      Rails.logger.error e.backtrace.join("\n")
+      render json: {
+        status: 'error',
+        message: 'Failed to verify code'
+      }, status: :unprocessable_entity
+    end
+  end
+
+  def verify_guid
+    Rails.logger.info "=== VERIFY GUID START ==="
+    Rails.logger.info "Handle: #{params[:handle]}"
+    Rails.logger.info "Device Data: #{params[:device_data]}"
+    
+    begin
+      user = User.find_by(handle: params[:handle])
+      unless user
+        return render json: {
+          status: 'error',
+          message: 'Handle not found'
+        }, status: :unprocessable_entity
+      end
+
+      device = find_active_device_for_user(user)
+      if device && device_database_verified?(device.device_database&.path)
+        ensure_database_exists(device)
+        sync_database_path(device)
+        
+        session[:user_id] = user.id
+        set_device_token(device)
+        
+        render json: {
+          status: 'authenticated',
+          redirect_to: '/dashboard',
+          database_path: device.device_database.path
+        }
+      else
+        # Generate verification code
+        verification_id = SecureRandom.uuid
+        verification_code = rand(100000..999999).to_s
+
+        verification_data = {
+          handle: params[:handle],
+          verification_id: verification_id,
+          device_data: params[:device_data],
+          code: verification_code,
+          expires_at: 10.minutes.from_now,
+          type: 'guid'
+        }
+
+        store_verification_data("verification:#{verification_id}", verification_data)
+        set_verification_cookies(verification_id)
+
+        if TwilioService.send_verification_code(user.phone, verification_code)
+          render json: {
+            status: 'pending_verification',
+            message: "Enter the verification code sent to #{User.mask_phone(user.phone)}",
+            database_path: params[:device_data].dig('database', 'path')
+          }
+        else
+          render json: {
+            status: 'error',
+            message: 'Failed to send verification code'
+          }, status: :unprocessable_entity
+        end
+      end
+    rescue StandardError => e
+      Rails.logger.error "GUID verification error: #{e.message}"
+      Rails.logger.error e.backtrace.join("\n")
+      render json: {
+        status: 'error',
+        message: 'Failed to verify handle'
+      }, status: :unprocessable_entity
+    end
+  end
+def verify_guid_code
+    Rails.logger.info "=== VERIFY GUID CODE START ==="
+    Rails.logger.info "Code: #{params[:code]}"
+    Rails.logger.info "Handle: #{params[:handle]}"
+    
+    begin
+      verification_id = cookies.signed[:verification_id]
+      verification_data = retrieve_verification_data("verification:#{verification_id}")
+
+      unless verification_data && verification_data[:type] == 'guid'
+        return render json: { 
+          status: 'error',
+          message: 'Verification session expired'
+        }, status: :unprocessable_entity
+      end
+
+      unless verification_data[:code] == params[:code]
+        return render json: {
+          status: 'error',
+          message: 'Invalid verification code'
+        }, status: :unprocessable_entity
+      end
+
+      user = User.find_by(handle: verification_data[:handle])
+      unless user
+        return render json: {
+          status: 'error',
+          message: 'User not found'
+        }, status: :unprocessable_entity
+      end
+
+      device = find_or_create_device(user, verification_data[:device_data])
+      ensure_database_exists(device)
+      mark_device_verified(device)
+      sync_database_path(device)
+
+      session[:user_id] = user.id
+      set_device_token(device)
+
+      remove_verification_data("verification:#{verification_id}")
+      clear_verification_cookies
+
+      render json: {
+        status: 'authenticated',
+        redirect_to: '/dashboard',
+        database_path: device.device_database.path,
+        handle: user.handle
+      }
+    rescue => e
+      Rails.logger.error "GUID code verification error: #{e.message}"
+      Rails.logger.error e.backtrace.join("\n")
+      render json: {
+        status: 'error',
+        message: 'Failed to verify code'
+      }, status: :unprocessable_entity
+    end
+  end
+
+  def update_handle
+    Rails.logger.info "=== UPDATE HANDLE START ==="
+    Rails.logger.info "Handle: #{params[:handle]}"
+    
+    begin
+      handle = "@#{params[:handle].to_s.strip.gsub(/^@+/, '')}"
+      
+      unless handle.match?(/^@[a-zA-Z0-9_]+$/)
+        return render json: { 
+          status: 'error', 
+          message: 'Handle must start with @ and contain only letters, numbers, and underscores' 
+        }, status: :unprocessable_entity
+      end
+
+      verification_id = cookies.signed[:verification_id]
+      verification_data = retrieve_verification_data("handle_pending:#{verification_id}")
+
+      if verification_data
+        # New user flow
+        if User.exists?(handle: handle)
+          return render json: {
+            status: 'error',
+            message: 'Handle already taken'
+          }, status: :unprocessable_entity
+        end
+
+        user = User.create!(
+          phone: verification_data[:phone],
+          handle: handle,
+          verified: true
+        )
+        
+        device = find_or_create_device(user, verification_data[:device_data])
+        ensure_database_exists(device)
+        mark_device_verified(device)
+        sync_database_path(device)
+        
+        session[:user_id] = user.id
+        set_device_token(device)
+        
+        remove_verification_data("handle_pending:#{verification_id}")
+        clear_verification_cookies
+
+        render json: {
+          status: 'success',
+          handle: handle,
+          redirect_to: '/dashboard',
+          database_path: device.device_database.path
+        }
+      elsif current_user
+        # Existing user handle update
+        if User.where.not(id: current_user.id).exists?(handle: handle)
+          return render json: {
+            status: 'error',
+            message: 'Handle already taken'
+          }, status: :unprocessable_entity
+        end
+
+        current_user.update!(handle: handle)
+        
+        if current_device&.device_database&.path
+          ensure_database_exists(current_device)
+          update_device_database(current_device, handle: handle)
+          sync_database_path(current_device)
+        end
+        
+        render json: {
+          status: 'success',
+          handle: handle,
+          database_path: current_device&.device_database&.path
+        }
+      else
+        render json: {
+          status: 'error',
+          message: 'Invalid session'
+        }, status: :unprocessable_entity
+      end
+    rescue => e
+      Rails.logger.error "Handle update error: #{e.message}"
+      Rails.logger.error e.backtrace.join("\n")
+      render json: {
+        status: 'error',
+        message: 'Failed to update handle'
+      }, status: :unprocessable_entity
+    end
+  end
+
+  private
+
+  def handle_new_user_registration(user, device_data)
+    verification_id = SecureRandom.uuid
+    verification_code = rand(100000..999999).to_s
+
+    verification_data = {
+      phone: user.phone,
+      verification_id: verification_id,
+      device_data: device_data,
+      code: verification_code,
+      expires_at: 10.minutes.from_now,
+      type: 'phone'
+    }
+
+    store_verification_data("verification:#{verification_id}", verification_data)
+    set_verification_cookies(verification_id)
+
+    if TwilioService.send_verification_code(user.phone, verification_code)
+      {
+        status: 'pending_verification',
+        message: "Enter verification code sent to #{User.mask_phone(user.phone)}",
+        database_path: device_data.dig('database', 'path')
+      }
+    else
+      { status: 'error', message: 'Failed to send verification code' }
+    end
+  end
+
+  def handle_existing_user_login(user, device_data)
+    existing_device = find_active_device_for_user(user)
+    
+    if existing_device && device_database_verified?(existing_device.device_database&.path)
+      ensure_database_exists(existing_device)
+      sync_database_path(existing_device)
+      
+      session[:user_id] = user.id
+      set_device_token(existing_device)
+      
+      {
+        status: 'authenticated',
+        redirect_to: '/dashboard',
+        database_path: existing_device.device_database.path,
+        device: existing_device
+      }
+    else
+      verification_id = SecureRandom.uuid
+      verification_code = rand(100000..999999).to_s
+
+      verification_data = {
+        phone: user.phone,
+        verification_id: verification_id,
+        device_data: device_data,
+        code: verification_code,
+        expires_at: 10.minutes.from_now,
+        type: 'phone'
+      }
+
+      store_verification_data("verification:#{verification_id}", verification_data)
+      set_verification_cookies(verification_id)
+
+      if TwilioService.send_verification_code(user.phone, verification_code)
+        {
+          status: 'pending_verification',
+          message: "Enter verification code sent to #{User.mask_phone(user.phone)}",
+          database_path: existing_device&.device_database&.path,
+          device: existing_device
+        }
+      else
+        { status: 'error', message: 'Failed to send verification code' }
+      end
+    end
+  end
+
+  def store_verification_data(key, data)
+    Rails.cache.write(key, data, expires_in: 10.minutes)
+  end
+
+  def retrieve_verification_data(key)
+    Rails.cache.read(key)
+  end
+
+  def remove_verification_data(key)
+    Rails.cache.delete(key)
+  end
+
+  def set_verification_cookies(verification_id)
+    cookie_opts = {
+      value: verification_id,
+      domain: determine_cookie_domain,
+      secure: true,
+      same_site: determine_same_site_policy,
+      path: '/',
+      expires: 10.minutes.from_now,
+      httponly: true
+    }
+
+    cookies[:verification_id] = cookie_opts
+    cookies.signed[:verification_id] = cookie_opts
+  end
+
+  def clear_verification_cookies
+    cookie_opts = {
+      value: nil,
+      expires: 1.minute.ago,
+      domain: determine_cookie_domain,
+      secure: true,
+      same_site: determine_same_site_policy,
+      path: '/'
+    }
+    
+    cookies[:verification_id] = cookie_opts
+    cookies.signed[:verification_id] = cookie_opts
+  end
+
+  def extract_device_data(request)
+    {
+      platform: request.headers['sec-ch-ua-platform'],
+      device_type: DeviceRecognitionService.detect_device_type(request.user_agent),
+      os: DeviceRecognitionService.detect_os(request.user_agent),
+      browser: {
+        name: DeviceRecognitionService.detect_browser(request.user_agent),
+        version: DeviceRecognitionService.detect_browser_version(request.user_agent),
+        userAgent: request.user_agent
+      },
+      database: {
+        path: cookies[:device_database_path],
+        exists: cookies[:device_database_path].present?
+      },
+      timestamp: Time.current.to_i
+    }
+  end
+
+  def generate_suggested_handle
+    base = "@user"
+    random_suffix = SecureRandom.hex(4)
+    "#{base}_#{random_suffix}"
+  end
+
+  def determine_cookie_domain
+    return request.domain if request.domain.present?
+    return request.host if request.host.present?
+    'localhost'
+  end
+
+  def determine_same_site_policy
+    return :none if request.user_agent =~ /Safari/i && request.user_agent !~ /Chrome/i
+    :lax
+  end
+end

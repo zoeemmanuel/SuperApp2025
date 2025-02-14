@@ -1,0 +1,598 @@
+# Part 1 - Module Setup and Check Device
+module Api
+  module V1
+    class AuthController < Api::V1::BaseController
+      include DeviceAuthenticationConcern
+      include VerificationConcern
+      include DeviceRecognitionConcern
+
+      skip_before_action :verify_authenticity_token
+      skip_before_action :authenticate_user!
+
+      def check_device
+        Rails.logger.info "=== CHECK DEVICE START ==="
+        begin
+          device_data = process_device_data
+          db_path = URI.decode_www_form_component(device_data.dig('database', 'path') || cookies[:device_database_path].to_s)
+          browser_info = device_data['browser_info']
+          
+          Rails.logger.info "Checking device with database path: #{db_path}"
+          Rails.logger.info "Cookies present: #{cookies.to_h}"
+          
+          if db_path && File.exist?(Rails.root.join(db_path))
+            device_info = read_device_info_from_db(db_path)
+            Rails.logger.info "Found device info: #{device_info.inspect}"
+            
+            if device_info && device_info['device_id']
+              device = Device.find_by(device_id: device_info['device_id'])
+              
+              if device&.user
+                Rails.logger.info "Found device with user: #{device.user.handle}"
+                
+                # Check device verification
+                verified = device_database_verified?(db_path)
+                Rails.logger.info "Device verification status: #{verified}"
+                
+                # Always mark as unverified when there's no session
+                if cookies[:device_token].blank? || session[:user_id].blank?
+                  verified = false
+                  update_device_database(device, {
+                    verified: false,
+                    last_sync: Time.current.iso8601
+                  })
+                end
+                
+                # Set storage data
+                storage_data = {
+                  device_database_path: db_path,
+                  handle: device.user.handle,
+                  masked_phone: device.user.masked_phone,
+                  verified: verified,
+                  guid_enabled: true,
+                  known_device: true,
+                  show_guid: true,
+                  sync_time: Time.current.iso8601
+                }
+                response.headers['X-Set-Storage'] = storage_data.to_json
+                Rails.logger.info "Set storage data: #{storage_data.inspect}"
+                
+                # Update device cookies
+                cookies[:device_database_path] = {
+                  value: db_path,
+                  domain: determine_cookie_domain,
+                  secure: true,
+                  same_site: :lax,
+                  path: '/',
+                  expires: 1.year.from_now,
+                  httponly: false
+                }
+                
+                if verified
+                  set_device_token(device)
+                end
+                
+                update_device_database(device, {
+                  verified: verified,
+                  last_check: Time.current.iso8601,
+                  last_sync: Time.current.iso8601
+                })
+                
+                # Return status as device_known when it's a known device
+                return render json: {
+                  status: 'device_known',
+                  handle: device.user.handle,
+                  database_path: db_path,
+                  masked_phone: device.user.masked_phone,
+                  verified: verified,
+                  guid_enabled: true,
+                  needs_verification: !verified,
+                  message: "Welcome back #{device.user.handle}! Please confirm your number."
+                }
+              end
+            end
+          end
+
+          # Create new device if none found
+          Rails.logger.info "Creating new device data..."
+          new_device_data = create_new_device_data(browser_info)
+          sync_new_device_data(new_device_data)
+          
+          render json: { 
+            status: 'unknown_device',
+            database_path: new_device_data[:database_path]
+          }
+        rescue => e
+          Rails.logger.error "Check device error: #{e.message}"
+          Rails.logger.error e.backtrace.join("\n")
+          render json: { status: 'error', message: 'Failed to check device' }
+        end
+      end
+# Part 2 - Phone Login and Related Methods
+def phone_login
+  Rails.logger.info "=== PHONE LOGIN START ==="
+  begin
+    # Parse core parameters
+    phone = params[:phone].to_s.strip
+    handle = params[:handle].to_s.strip
+    
+    # Added more explicit send_code handling
+    Rails.logger.info "Raw params: #{params.inspect}"
+    send_code = [true, 'true', 1, '1'].include?(params[:send_code])
+    
+    device_data = process_device_data
+    
+    # Debug logging
+    Rails.logger.info "Raw send_code param type: #{params[:send_code].class}"
+    Rails.logger.info "Raw send_code param value: #{params[:send_code].inspect}"
+    Rails.logger.info "Raw auth send_code param: #{params.dig(:auth, :send_code).inspect}"
+    Rails.logger.info "Final send_code value: #{send_code}"
+    Rails.logger.info "Phone: #{phone}"
+    Rails.logger.info "Handle: #{handle}"
+    Rails.logger.info "Send Code Value: #{send_code}"
+    Rails.logger.info "Device Data: #{device_data.inspect}"
+
+    unless TwilioService.valid_phone_format?(phone)
+      Rails.logger.error "Invalid phone format: #{phone}"
+      return render json: { 
+        status: 'error',
+        message: 'Please enter a valid UK (+44) or Singapore (+65) phone number'
+      }, status: :unprocessable_entity
+    end
+
+    # Check for existing user first
+    existing_user = User.find_by(phone: phone)
+    Rails.logger.info "Existing user found: #{existing_user&.handle}"
+
+    if send_code
+      verification_id = SecureRandom.uuid
+      verification_code = rand(100000..999999).to_s
+      Rails.logger.info "Generated verification ID: #{verification_id}"
+      Rails.logger.info "Attempting to send verification code..."
+
+      if TwilioService.send_verification_code(phone, verification_code)
+        Rails.logger.info "Successfully sent verification code"
+        verification_data = {
+          phone: phone,
+          verification_id: verification_id,
+          device_data: device_data,
+          code: verification_code,
+          expires_at: 10.minutes.from_now,
+          type: 'phone'
+        }
+
+        store_verification_data("verification:#{verification_id}", verification_data)
+
+        cookie_opts = {
+          value: verification_id,
+          domain: determine_cookie_domain,
+          secure: true,
+          same_site: :lax,
+          path: '/',
+          expires: 10.minutes.from_now,
+          httponly: true
+        }
+
+        cookies[:verification_id] = cookie_opts
+        cookies.signed[:verification_id] = cookie_opts
+
+        storage_data = {
+          device_database_path: device_data.dig('database', 'path'),
+          verification_id: verification_id,
+          sync_time: Time.current.iso8601
+        }
+
+        if existing_user
+          storage_data.merge!({
+            handle: existing_user.handle,
+            masked_phone: existing_user.masked_phone,
+            guid_enabled: true
+          })
+        end
+
+        response.headers['X-Set-Storage'] = storage_data.to_json
+
+        render json: {
+          status: 'pending_verification',
+          welcome_message: existing_user ? "Welcome back #{existing_user.handle}!" : "Welcome to SuperApp!",
+          message: "Enter the verification code sent to #{User.mask_phone(phone)}",
+          handle: existing_user&.handle,
+          masked_phone: User.mask_phone(phone),
+          database_path: device_data.dig('database', 'path'),
+          guid_enabled: existing_user.present?
+        }
+      else
+        Rails.logger.error "Failed to send verification code to #{phone}"
+        render json: {
+          status: 'error',
+          message: 'Failed to send verification code'
+        }, status: :unprocessable_entity
+      end
+    else
+      # First step - just show confirmation screen
+      storage_data = {
+        device_database_path: device_data.dig('database', 'path'),
+        handle: existing_user&.handle,
+        masked_phone: User.mask_phone(phone),
+        guid_enabled: true,
+        known_device: existing_user.present?,
+        show_guid: true,
+        sync_time: Time.current.iso8601
+      }
+      
+      response.headers['X-Set-Storage'] = storage_data.to_json
+      Rails.logger.info "Set storage data for initial screen: #{storage_data.inspect}"
+
+      return render json: {
+        status: 'confirm_number',
+        handle: existing_user&.handle,
+        masked_phone: User.mask_phone(phone),
+        guid_enabled: existing_user.present?,
+        needs_code: true,
+        message: existing_user ? 
+          "Welcome back #{existing_user.handle}! Please confirm your number: #{User.mask_phone(phone)}" :
+          "Confirm this is your number: #{User.mask_phone(phone)}"
+      }
+    end
+  rescue => e
+    Rails.logger.error "Phone login error: #{e.message}"
+    Rails.logger.error e.backtrace.join("\n")
+    render json: {
+      status: 'error',
+      message: 'Failed to process phone login'
+    }, status: :internal_server_error
+  end
+end
+# Part 3 - Verification and Handle Methods
+def verify_code
+  Rails.logger.info "=== VERIFY CODE START ==="
+  Rails.logger.info "Database Path Cookie: #{cookies[:device_database_path]}"
+  Rails.logger.info "Verification ID Cookie: #{cookies.signed[:verification_id]}"
+  
+  begin
+    code = params[:code].to_s.strip
+    verification_id = cookies.signed[:verification_id]
+    device_data = process_device_data || {}
+    
+    Rails.logger.info "Processing verification code: #{code}"
+    Rails.logger.info "With verification ID: #{verification_id}"
+    
+    unless verification_id
+      Rails.logger.error "No verification ID found in signed cookies"
+      return render json: { 
+        status: 'error',
+        message: 'Verification session expired'
+      }, status: :unprocessable_entity
+    end
+
+    verification_data = retrieve_verification_data("verification:#{verification_id}")
+    unless verification_data
+      Rails.logger.error "No verification data found for ID: #{verification_id}"
+      return render json: {
+        status: 'error',
+        message: 'Verification session expired'
+      }, status: :unprocessable_entity
+    end
+
+    Rails.logger.info "Retrieved verification data: #{verification_data.inspect}"
+    
+    unless verification_data[:code] == code
+      Rails.logger.error "Code mismatch: expected #{verification_data[:code]}, got #{code}"
+      return render json: {
+        status: 'error',
+        message: 'Invalid verification code'
+      }, status: :unprocessable_entity
+    end
+
+    expires_at = verification_data[:expires_at].is_a?(String) ? 
+      Time.parse(verification_data[:expires_at]) : verification_data[:expires_at]
+    
+    if expires_at < Time.current
+      remove_verification_data("verification:#{verification_id}")
+      clear_verification_cookies
+      return render json: {
+        status: 'error',
+        message: 'Verification code expired'
+      }, status: :unprocessable_entity
+    end
+
+    user = User.find_by(phone: verification_data[:phone])
+    if user
+      device = find_or_create_device(user, device_data)
+      ensure_database_exists(device)
+      mark_device_verified(device)
+      sync_database_path(device)
+      
+      session[:user_id] = user.id
+      set_device_token(device)
+
+      remove_verification_data("verification:#{verification_id}")
+      clear_verification_cookies
+
+      render json: {
+        status: 'authenticated',
+        redirect_to: '/dashboard',
+        database_path: device.device_database.path,
+        handle: user.handle
+      }
+    else
+      verification_data[:verified] = true
+      store_verification_data("handle_pending:#{verification_id}", verification_data)
+      
+      @storage_header = {
+        device_database_path: device_data.dig('database', 'path'),
+        sync_time: Time.current.iso8601
+      }.to_json
+      
+      response.headers['X-Set-Storage'] = @storage_header
+
+      render json: {
+        status: 'needs_handle',
+        message: 'Please set your handle to continue',
+        database_path: device_data.dig('database', 'path'),
+        suggested_handle: generate_suggested_handle
+      }
+    end
+  rescue => e
+    Rails.logger.error "Code verification error: #{e.message}"
+    Rails.logger.error e.backtrace.join("\n")
+    render json: {
+      status: 'error',
+      message: 'Verification failed'
+    }, status: :internal_server_error
+  end
+end
+
+def update_handle
+  Rails.logger.info "=== UPDATE HANDLE START ==="
+  Rails.logger.info "Handle: #{params[:handle]}"
+  
+  begin
+    handle = "@#{params[:handle].to_s.strip.gsub(/^@+/, '')}"
+    
+    unless handle.match?(/^@[a-zA-Z0-9_]+$/)
+      return render json: { 
+        status: 'error', 
+        message: 'Handle must start with @ and contain only letters, numbers, and underscores' 
+      }, status: :unprocessable_entity
+    end
+
+    if User.where.not(id: current_user&.id).exists?(handle: handle)
+      return render json: {
+        status: 'error',
+        message: 'Handle already taken'
+      }, status: :unprocessable_entity
+    end
+
+    verification_id = cookies.signed[:verification_id]
+    verification_data = verification_id ? 
+      retrieve_verification_data("handle_pending:#{verification_id}") : nil
+
+    if verification_data
+      user = User.create!(
+        phone: verification_data[:phone],
+        handle: handle,
+        verified: true
+      )
+      
+      device = find_or_create_device(user, verification_data[:device_data])
+      ensure_database_exists(device)
+      mark_device_verified(device)
+      sync_database_path(device)
+      
+      session[:user_id] = user.id
+      set_device_token(device)
+      
+      remove_verification_data("handle_pending:#{verification_id}")
+      clear_verification_cookies
+
+      render json: {
+        status: 'success',
+        handle: handle,
+        redirect_to: '/dashboard',
+        database_path: device.device_database.path
+      }
+    elsif current_user
+      if current_user.update(handle: handle)
+        if current_device&.device_database&.path
+          ensure_database_exists(current_device)
+          update_device_database(current_device, handle: handle)
+          sync_database_path(current_device)
+        end
+        
+        render json: {
+          status: 'success',
+          handle: handle,
+          database_path: current_device&.device_database&.path
+        }
+      else
+        render json: {
+          status: 'error',
+          message: current_user.errors.full_messages.join(', ')
+        }, status: :unprocessable_entity
+      end
+    else
+      render json: {
+        status: 'error',
+        message: 'Invalid session'
+      }, status: :unprocessable_entity
+    end
+  rescue => e
+    Rails.logger.error "Handle update error: #{e.message}"
+    Rails.logger.error e.backtrace.join("\n")
+    render json: {
+      status: 'error',
+      message: 'Failed to update handle'
+    }, status: :unprocessable_entity
+  end
+end
+# Part 4 - Utility Methods and Private Helpers
+private
+
+def determine_cookie_domain
+  return request.domain if request.domain.present?
+  return request.host if request.host.present?
+  'localhost'
+end
+
+def determine_same_site_policy
+  return :none if request.user_agent =~ /Safari/i && request.user_agent !~ /Chrome/i
+  :lax
+end
+
+def read_device_info_from_db(db_path)
+  return nil unless db_path && File.exist?(Rails.root.join(db_path))
+  
+  begin
+    db = SQLite3::Database.new(Rails.root.join(db_path).to_s)
+    db.results_as_hash = true
+    device_info = db.execute("SELECT * FROM device_info")
+                   .each_with_object({}) { |row, hash| hash[row['key'] || row[0]] = row['value'] || row[1] }
+    db.close
+    
+    Rails.logger.info "Found device info in SQLite: #{device_info.inspect}"
+    
+    # Clean up and verify critical fields
+    if device_info['device_id'].present?
+      device = Device.find_by(device_id: device_info['device_id'])
+      if device&.active?
+        device_info['verified'] = device_database_verified?(db_path).to_s
+        device_info['last_check'] = Time.current.iso8601
+        update_device_info(device, device_info)
+      end
+    end
+    
+    device_info
+  rescue SQLite3::Exception => e
+    Rails.logger.error "Database read error: #{e.message}"
+    nil
+  end
+end
+
+def process_device_data
+  device_data = params[:device_data] || 
+                params.dig(:auth, :device_data) || 
+                (params.to_unsafe_h rescue {})['device_data']
+                
+  return {} unless device_data.present?
+
+  # Improved parameter parsing
+  device_data = case device_data
+                when ActionController::Parameters
+                  device_data.to_unsafe_h
+                when String
+                  JSON.parse(device_data) rescue {}
+                when Hash
+                  device_data.to_h
+                else
+                  {}
+                end
+  
+  Rails.logger.info "Processing device data: #{device_data.inspect}"
+  
+  # Clean up database path encoding
+  if device_data.dig('database', 'path')
+    path = device_data['database']['path']
+    while path =~ /%/
+      path = URI.decode_www_form_component(path)
+    end
+    device_data['database']['path'] = path
+  end
+  
+  # Add cookie path if not present
+  unless device_data.dig('database', 'path')
+    if cookie_path = cookies[:device_database_path]
+      path = cookie_path
+      while path =~ /%/
+        path = URI.decode_www_form_component(path)
+      end
+      device_data['database'] = {
+        'path' => path,
+        'exists' => File.exist?(Rails.root.join(path))
+      }
+    end
+  end
+  
+  {
+    'database' => device_data['database'],
+    'browser_info' => device_data.slice('hardware', 'screen', 'browser', 'gpu')
+  }
+end
+
+def update_device_database(device, updates = {})
+  return unless device&.device_database&.path
+  
+  db_path = Rails.root.join(device.device_database.path)
+  return unless File.exist?(db_path)
+
+  begin
+    db = SQLite3::Database.new(db_path.to_s)
+    db.transaction do
+      updates.each do |key, value|
+        db.execute(
+          "INSERT OR REPLACE INTO device_info (key, value) VALUES (?, ?)", 
+          [key.to_s, value.to_s]
+        )
+      end
+
+      db.execute(
+        "INSERT OR REPLACE INTO device_info (key, value) VALUES (?, ?)",
+        ["last_sync", Time.current.iso8601]
+      )
+    end
+    db.close
+  rescue SQLite3::Exception => e
+    Rails.logger.error "Database update error for device #{device.id}: #{e.message}"
+    Rails.logger.error e.backtrace.join("\n")
+  end
+end
+
+def set_device_token(device)
+  return unless device&.device_database&.path
+  
+  token = SecureRandom.uuid
+  db_path = Rails.root.join(device.device_database.path)
+  
+  begin
+    db = SQLite3::Database.new(db_path.to_s)
+    db.execute("INSERT OR REPLACE INTO device_info (key, value) VALUES (?, ?)", 
+              ["device_token", token])
+    db.close
+
+    cookies[:device_token] = {
+      value: token,
+      domain: determine_cookie_domain,
+      secure: true,
+      same_site: determine_same_site_policy,
+      path: '/',
+      expires: 1.year.from_now,
+      httponly: true
+    }
+  rescue SQLite3::Exception => e
+    Rails.logger.error "Error setting device token: #{e.message}"
+  end
+end
+
+def clear_verification_cookies
+  cookie_opts = {
+    value: nil,
+    expires: 1.minute.ago,
+    domain: determine_cookie_domain,
+    secure: true,
+    same_site: determine_same_site_policy,
+    path: '/'
+  }
+  
+  cookies[:verification_id] = cookie_opts
+  cookies.signed[:verification_id] = cookie_opts
+end
+
+def generate_suggested_handle
+  base = "@user"
+  random_suffix = SecureRandom.hex(4)
+  "#{base}_#{random_suffix}"
+end
+
+end  # End class AuthController
+end  # End module V1
+end  # End module Api
+

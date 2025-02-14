@@ -1,0 +1,13 @@
+# Read about fixtures at https://api.rubyonrails.org/classes/ActiveRecord/FixtureSet.html
+
+one:
+  device: one
+  path: MyString
+  sync_token: MyString
+  last_synced_at: 2025-01-30 15:05:21
+
+two:
+  device: two
+  path: MyString
+  sync_token: MyString
+  last_synced_at: 2025-01-30 15:05:21

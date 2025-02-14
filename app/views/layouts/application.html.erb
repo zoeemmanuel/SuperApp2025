@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title><%= content_for?(:title) ? yield(:title) : "SuperApp" %></title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <%= csrf_meta_tags %>
+    <%= csp_meta_tag %>
+
+    <%= stylesheet_link_tag "tailwind", "data-turbo-track": "reload" %>
+    <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
+    <%= javascript_include_tag "application", "data-turbo-track": "reload", defer: true %>
+    
+    <script>
+      // Storage initialization and synchronization
+      document.addEventListener('DOMContentLoaded', function() {
+        const syncStorage = async () => {
+          try {
+            // Check X-Set-Storage header from meta tag
+            const storageElement = document.querySelector('meta[name="x-set-storage"]');
+            if (storageElement?.content) {
+              const storageData = JSON.parse(storageElement.content);
+              if (storageData.device_database_path) {
+                localStorage.setItem('device_database_path', storageData.device_database_path);
+                localStorage.setItem('sync_time', storageData.sync_time);
+              }
+            }
+
+            // Fallback to cookies if no meta storage
+            const dbPath = getCookie('device_database_path');
+            if (dbPath && !localStorage.getItem('device_database_path')) {
+              localStorage.setItem('device_database_path', dbPath);
+              localStorage.setItem('sync_time', new Date().toISOString());
+            }
+          } catch (e) {
+            console.error('Storage sync failed:', e);
+          }
+        };
+
+        // Helper to safely get cookies
+        const getCookie = (name) => {
+          const value = `; ${document.cookie}`;
+          const parts = value.split(`; ${name}=`);
+          if (parts.length === 2) {
+            return decodeURIComponent(parts.pop().split(';').shift());
+          }
+        };
+
+        syncStorage();
+      });
+    </script>
+  </head>
+  <body>
+    <div class="min-h-screen bg-gray-50">
+      <main class="container mx-auto mt-28 px-5 flex">
+        <%= yield %>
+      </main>
+    </div>
+  </body>
+</html>
