@@ -1,6 +1,6 @@
 source "https://rubygems.org"
 
-gem "rails", "~> 8.0.1"
+gem "rails", "~> 8.0.2"
 gem "sprockets-rails"
 gem "sqlite3", "2.1.1"  # Pin to a specific version
 gem "puma", ">= 5.0"
